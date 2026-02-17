@@ -154,7 +154,8 @@ contract LendingPool is ReentrancyGuard {
 
         require(maxBorrow > 0, "Insufficient collateral");
         
-        uint256 availableLiquidity = _availableLiquidity();
+        // Available liquidity excludes the collateral being deposited
+        uint256 availableLiquidity = address(this).balance - msg.value;
         require(availableLiquidity >= maxBorrow, "Insufficient liquidity in pool");
 
         uint256 apr = _calculateAPR(msg.sender);

@@ -18,6 +18,11 @@ contract CreditScore {
         lendingPool = msg.sender;
     }
 
+    function setLendingPool(address _lendingPool) external {
+        require(lendingPool == msg.sender || lendingPool == address(0), "Not authorized");
+        lendingPool = _lendingPool;
+    }
+
     function getScore(address user) external view returns (int256) {
         return scores[user];
     }

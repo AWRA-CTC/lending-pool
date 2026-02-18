@@ -4,313 +4,348 @@ pragma solidity ^0.8.20;
 import "./CreditScore.sol";
 import "./IPriceOracle.sol";
 import "./LendToken.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract LendingPool is ReentrancyGuard {
+contract LendingPool is ReentrancyGuard, Ownable {
+    using SafeERC20 for IERC20;
+
+    uint256 public constant BASIS_POINTS = 10000;
+
+    CreditScore public creditScore;
+    IPriceOracle public oracle;
+
+    uint256 public loanCounter;
+
+    // -----------------------------
+    // STRUCTS
+    // -----------------------------
+
+    struct AssetConfig {
+        bool isActive;
+        uint256 collateralRatio;
+        uint256 liquidationRatio;
+        uint256 baseAPR;
+        uint256 aprFloor;
+        uint256 liquidationBonus;
+        address lendToken;
+        bool canBeCollateral;
+        bool canBeBorrowed;
+    }
+
     struct Loan {
         address borrower;
+        address collateralAsset;
+        address borrowAsset;
         uint256 principal;
         uint256 collateral;
-        uint256 apr; // basis points (e.g. 1000 = 10%)
+        uint256 apr;
         uint256 startTime;
         bool active;
     }
 
-    CreditScore public creditScore;
-    IPriceOracle public oracle;
-    LendToken public lendToken;
+    struct AssetBalance {
+        uint256 totalBorrowed;
+        uint256 totalInterestEarned;
+    }
 
-    uint256 public constant COLLATERAL_RATIO = 150; // 150%
-    uint256 public constant LIQUIDATION_RATIO = 140; // 140%
-    uint256 public constant BASE_APR = 1500; // 15%
-    uint256 public constant APR_FLOOR = 500; // 5%
-    uint256 public constant MIN_DEPOSIT = 5 * 10**18; // Minimum deposit: 5 CTC
-    uint256 public constant LIQUIDATION_BONUS = 500; // 5% (in basis points)
-
-    uint256 public loanCounter;
+    mapping(address => AssetConfig) public assetConfigs;
+    mapping(address => AssetBalance) public assetBalances;
     mapping(uint256 => Loan) public loans;
+    mapping(address => uint256[]) public userLoans;
 
-    // Liquidity tracking
-    uint256 public totalDeposited; // Total CTC deposited by lenders
-    uint256 public totalBorrowed; // Total CTC currently borrowed
-    uint256 public totalInterestEarned; // Accumulated interest from borrowers
+    address[] public supportedAssets;
 
-    // ----------------------------
-    // EVENTS
-    // ----------------------------
-
-    event Deposit(
-        address indexed user,
-        uint256 amount,
-        uint256 tokensReceived,
-        uint256 timestamp
-    );
-
-    event Withdraw(
-        address indexed user,
-        uint256 tokensReturned,
-        uint256 ctcReceived,
-        uint256 timestamp
-    );
-
-    event Borrow(
-        address indexed borrower,
-        uint256 indexed loanId,
-        uint256 principal,
-        uint256 collateral,
-        uint256 apr,
-        uint256 timestamp
-    );
-
-    event Repay(
-        address indexed borrower,
-        uint256 indexed loanId,
-        uint256 principal,
-        uint256 interest,
-        uint256 timestamp
-    );
-
-    event Liquidate(
-        address indexed liquidator,
-        address indexed borrower,
-        uint256 indexed loanId,
-        uint256 collateralSeized,
-        uint256 reward,
-        uint256 timestamp
-    );
-
-    constructor(address _creditScore, address _oracle) {
+    constructor(address _creditScore, address _oracle) Ownable(msg.sender) {
         creditScore = CreditScore(_creditScore);
         oracle = IPriceOracle(_oracle);
-        lendToken = new LendToken();
     }
 
-    // ----------------------------
-    // LENDER LOGIC
-    // ----------------------------
+    // --------------------------------------------------
+    // ---------------- LENDING -------------------------
+    // --------------------------------------------------
 
-    /**
-     * @notice Deposit CTC and receive aAWRA tokens
-     * @dev Mints tokens based on current exchange rate
-     */
-    function deposit() external payable nonReentrant {
-        require(msg.value >= MIN_DEPOSIT, "Below minimum deposit");
+    function deposit(address asset, uint256 amount)
+        external
+        payable
+        nonReentrant
+    {
+        AssetConfig memory config = assetConfigs[asset];
+        require(config.isActive, "Asset not supported");
 
-        uint256 tokensToMint;
-        
-        if (lendToken.totalSupply() == 0) {
-            // First deposit: 1:1 ratio
-            tokensToMint = msg.value;
+        uint256 depositAmount;
+
+        if (asset == address(0)) {
+            depositAmount = msg.value;
         } else {
-            // Calculate based on exchange rate
-            tokensToMint = (msg.value * lendToken.totalSupply()) / _poolValue();
+            require(msg.value == 0, "No native token");
+            depositAmount = amount;
+            IERC20(asset).safeTransferFrom(msg.sender, address(this), depositAmount);
         }
 
-        totalDeposited += msg.value;
-        lendToken.mint(msg.sender, tokensToMint);
+        uint256 exchangeRate = _getExchangeRate(asset);
+        uint256 mintAmount = (depositAmount * 1e18) / exchangeRate;
 
-        emit Deposit(msg.sender, msg.value, tokensToMint, block.timestamp);
+        LendToken(config.lendToken).mint(msg.sender, mintAmount);
     }
 
-    /**
-     * @notice Withdraw CTC by burning aAWRA tokens
-     * @param tokenAmount Amount of aAWRA tokens to burn
-     */
-    function withdraw(uint256 tokenAmount) external nonReentrant {
-        require(tokenAmount > 0, "Amount must be > 0");
-        require(lendToken.balanceOf(msg.sender) >= tokenAmount, "Insufficient balance");
+    function withdraw(address asset, uint256 aTokenAmount)
+        external
+        nonReentrant
+    {
+        AssetConfig memory config = assetConfigs[asset];
+        require(config.isActive, "Not supported");
 
-        uint256 ctcToReturn = (tokenAmount * _poolValue()) / lendToken.totalSupply();
-        uint256 availableLiquidity = _availableLiquidity();
-        
-        require(ctcToReturn <= availableLiquidity, "Insufficient liquidity");
+        LendToken lendToken = LendToken(config.lendToken);
 
-        totalDeposited -= ctcToReturn;
-        lendToken.burn(msg.sender, tokenAmount);
-        
-        payable(msg.sender).transfer(ctcToReturn);
+        uint256 exchangeRate = _getExchangeRate(asset);
+        uint256 withdrawAmount = (aTokenAmount * exchangeRate) / 1e18;
 
-        emit Withdraw(msg.sender, tokenAmount, ctcToReturn, block.timestamp);
-    }
+        require(withdrawAmount <= _availableLiquidity(asset), "Insufficient liquidity");
 
-    /**
-     * @notice Get current exchange rate (CTC per aAWRA token)
-     * @return Exchange rate in wei (1e18 = 1:1)
-     */
-    function getExchangeRate() external view returns (uint256) {
-        if (lendToken.totalSupply() == 0) {
-            return 1e18; // 1:1 initial rate
+        lendToken.burn(msg.sender, aTokenAmount);
+
+        if (asset == address(0)) {
+            payable(msg.sender).transfer(withdrawAmount);
+        } else {
+            IERC20(asset).safeTransfer(msg.sender, withdrawAmount);
         }
-        return (_poolValue() * 1e18) / lendToken.totalSupply();
     }
 
-    // ----------------------------
-    // BORROW
-    // ----------------------------
+    // --------------------------------------------------
+    // ---------------- BORROW --------------------------
+    // --------------------------------------------------
 
-    function borrow() external payable nonReentrant {
-        uint256 collateralValue = _collateralValue(msg.value);
-        uint256 maxBorrow = (collateralValue * 100) / COLLATERAL_RATIO;
+    function borrow(
+        address collateralAsset,
+        address borrowAsset,
+        uint256 collateralAmount,
+        uint256 borrowAmount
+    ) external payable nonReentrant {
 
-        require(maxBorrow > 0, "Insufficient collateral");
-        
-        // Available liquidity excludes the collateral being deposited
-        uint256 availableLiquidity = address(this).balance - msg.value;
-        require(availableLiquidity >= maxBorrow, "Insufficient liquidity in pool");
+        AssetConfig memory colConfig = assetConfigs[collateralAsset];
+        AssetConfig memory borConfig = assetConfigs[borrowAsset];
 
-        uint256 apr = _calculateAPR(msg.sender);
+        require(colConfig.isActive && colConfig.canBeCollateral, "Invalid collateral");
+        require(borConfig.isActive && borConfig.canBeBorrowed, "Invalid borrow asset");
+
+        uint256 actualCollateral;
+
+        if (collateralAsset == address(0)) {
+            actualCollateral = msg.value;
+        } else {
+            require(msg.value == 0, "No native token");
+            actualCollateral = collateralAmount;
+            IERC20(collateralAsset).safeTransferFrom(msg.sender, address(this), actualCollateral);
+        }
+
+        uint256 collateralValue = _getAssetValue(collateralAsset, actualCollateral);
+
+        uint256 maxBorrowValue = (collateralValue * BASIS_POINTS) / colConfig.collateralRatio;
+
+        uint256 borrowValue = _getAssetValue(borrowAsset, borrowAmount);
+
+        require(borrowValue <= maxBorrowValue, "Exceeds borrow limit");
+        require(borrowAmount <= _availableLiquidity(borrowAsset), "Insufficient liquidity");
+
+        uint256 apr = _calculateAPR(msg.sender, borrowAsset);
 
         loans[++loanCounter] = Loan({
             borrower: msg.sender,
-            principal: maxBorrow,
-            collateral: msg.value,
+            collateralAsset: collateralAsset,
+            borrowAsset: borrowAsset,
+            principal: borrowAmount,
+            collateral: actualCollateral,
             apr: apr,
             startTime: block.timestamp,
             active: true
         });
 
-        totalBorrowed += maxBorrow;
+        userLoans[msg.sender].push(loanCounter);
 
-        payable(msg.sender).transfer(maxBorrow);
+        assetBalances[borrowAsset].totalBorrowed += borrowAmount;
 
-        emit Borrow(
-            msg.sender,
-            loanCounter,
-            maxBorrow,
-            msg.value,
-            apr,
-            block.timestamp
-        );
+        if (borrowAsset == address(0)) {
+            payable(msg.sender).transfer(borrowAmount);
+        } else {
+            IERC20(borrowAsset).safeTransfer(msg.sender, borrowAmount);
+        }
     }
 
-    // ----------------------------
-    // REPAY
-    // ----------------------------
+    // --------------------------------------------------
+    // ---------------- REPAY ---------------------------
+    // --------------------------------------------------
 
-    function repay(uint256 loanId) external payable nonReentrant {
+    function repay(uint256 loanId, uint256 repayAmount)
+        external
+        payable
+        nonReentrant
+    {
         Loan storage loan = loans[loanId];
-        require(loan.active, "Loan not active");
-        require(msg.sender == loan.borrower, "Not the borrower");
+        require(loan.active, "Inactive loan");
+        require(msg.sender == loan.borrower, "Not borrower");
 
         uint256 interest = _interestOwed(loan);
         uint256 totalOwed = loan.principal + interest;
 
-        require(msg.value >= totalOwed, "Insufficient repayment");
+        uint256 payment;
 
-        loan.active = false;
-
-        // Add interest to pool earnings (lenders profit!)
-        totalInterestEarned += interest;
-        totalBorrowed -= loan.principal;
-
-        // Reward good behavior
-        creditScore.increaseScore(msg.sender, 10);
-
-        // Return collateral
-        payable(msg.sender).transfer(loan.collateral);
-
-        // Refund excess payment
-        if (msg.value > totalOwed) {
-            payable(msg.sender).transfer(msg.value - totalOwed);
+        if (loan.borrowAsset == address(0)) {
+            payment = msg.value;
+        } else {
+            payment = repayAmount;
+            IERC20(loan.borrowAsset).safeTransferFrom(msg.sender, address(this), payment);
         }
 
-        emit Repay(
-            msg.sender,
-            loanId,
-            loan.principal,
-            interest,
-            block.timestamp
-        );
+        require(payment > 0, "No payment");
+
+        if (payment >= totalOwed) {
+            // full repayment
+            loan.active = false;
+            assetBalances[loan.borrowAsset].totalBorrowed -= loan.principal;
+            assetBalances[loan.borrowAsset].totalInterestEarned += interest;
+
+            _returnCollateral(loan);
+            creditScore.increaseScore(msg.sender, 10);
+        } else {
+            // partial repayment
+            loan.principal = totalOwed - payment;
+            loan.startTime = block.timestamp;
+        }
     }
 
-    // ----------------------------
-    // LIQUIDATION
-    // ----------------------------
+    // --------------------------------------------------
+    // ---------------- LIQUIDATION ---------------------
+    // --------------------------------------------------
 
-    function liquidate(uint256 loanId) external nonReentrant {
+    function liquidate(uint256 loanId)
+        external
+        payable
+        nonReentrant
+    {
         Loan storage loan = loans[loanId];
-        require(loan.active, "Loan not active");
+        require(loan.active, "Inactive");
 
-        uint256 collateralValue = _collateralValue(loan.collateral);
         uint256 interest = _interestOwed(loan);
-        uint256 loanValue = loan.principal + interest;
+        uint256 totalDebt = loan.principal + interest;
 
-        uint256 ratio = (collateralValue * 100) / loanValue;
-        require(ratio < LIQUIDATION_RATIO, "Loan not liquidatable");
+        uint256 collateralValue = _getAssetValue(loan.collateralAsset, loan.collateral);
+        uint256 debtValue = _getAssetValue(loan.borrowAsset, totalDebt);
+
+        AssetConfig memory config = assetConfigs[loan.collateralAsset];
+
+        uint256 ratio = (collateralValue * BASIS_POINTS) / debtValue;
+
+        require(ratio < config.liquidationRatio, "Healthy loan");
+
+        // liquidator repays full debt
+        if (loan.borrowAsset == address(0)) {
+            require(msg.value >= totalDebt, "Insufficient repay");
+        } else {
+            IERC20(loan.borrowAsset).safeTransferFrom(msg.sender, address(this), totalDebt);
+        }
 
         loan.active = false;
-        totalBorrowed -= loan.principal;
 
-        // Punish bad behavior
+        assetBalances[loan.borrowAsset].totalBorrowed -= loan.principal;
+        assetBalances[loan.borrowAsset].totalInterestEarned += interest;
+
+        uint256 bonusCollateral =
+            (loan.collateral * (BASIS_POINTS + config.liquidationBonus))
+            / BASIS_POINTS;
+
+        uint256 seized = bonusCollateral > loan.collateral
+            ? loan.collateral
+            : bonusCollateral;
+
+        if (loan.collateralAsset == address(0)) {
+            payable(msg.sender).transfer(seized);
+        } else {
+            IERC20(loan.collateralAsset).safeTransfer(msg.sender, seized);
+        }
+
         creditScore.decreaseScore(loan.borrower, 30);
-
-        // Calculate liquidator reward (5% of collateral)
-        uint256 liquidatorReward = (loan.collateral * LIQUIDATION_BONUS) / 10000;
-        uint256 protocolShare = loan.collateral - liquidatorReward;
-
-        // Liquidator gets bonus
-        payable(msg.sender).transfer(liquidatorReward);
-
-        // Rest stays in pool as profit for lenders
-        totalInterestEarned += protocolShare;
-
-        emit Liquidate(
-            msg.sender,
-            loan.borrower,
-            loanId,
-            loan.collateral,
-            liquidatorReward,
-            block.timestamp
-        );
     }
 
-    // ----------------------------
-    // INTERNAL LOGIC
-    // ----------------------------
+    // --------------------------------------------------
+    // ---------------- INTERNALS -----------------------
+    // --------------------------------------------------
 
-    function _calculateAPR(address user) internal view returns (uint256) {
+    function _calculateAPR(address user, address asset)
+        internal
+        view
+        returns (uint256)
+    {
+        AssetConfig memory config = assetConfigs[asset];
         int256 score = creditScore.getScore(user);
-        int256 discount = score * 50; // 0.5% per credit point
 
-        int256 apr = int256(BASE_APR) - discount;
+        int256 discount = score * 50; // 0.5% per point
+        int256 apr = int256(config.baseAPR) - discount;
 
-        if (apr < int256(APR_FLOOR)) {
-            apr = int256(APR_FLOOR);
+        if (apr < int256(config.aprFloor)) {
+            apr = int256(config.aprFloor);
         }
 
         return uint256(apr);
     }
 
-    function _interestOwed(Loan memory loan) internal view returns (uint256) {
+    function _interestOwed(Loan memory loan)
+        internal
+        view
+        returns (uint256)
+    {
         uint256 timeElapsed = block.timestamp - loan.startTime;
-        return (loan.principal * loan.apr * timeElapsed) / (365 days * 10000);
+        return (loan.principal * loan.apr * timeElapsed)
+            / (365 days * BASIS_POINTS);
     }
 
-    function _collateralValue(uint256 amount) internal view returns (uint256) {
-        uint256 price = oracle.getPrice(address(0)); // native token
-        return (amount * price) / 1e8;
+    function _getAssetValue(address asset, uint256 amount)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256 price = oracle.getPrice(asset);
+        uint8 decimals = oracle.getDecimals(asset);
+        return (amount * price) / (10 ** decimals);
     }
 
-    /**
-     * @notice Total value of pool (deposits + interest earned)
-     */
-    function _poolValue() internal view returns (uint256) {
-        return totalDeposited + totalInterestEarned;
+    function _getExchangeRate(address asset)
+        internal
+        view
+        returns (uint256)
+    {
+        AssetConfig memory config = assetConfigs[asset];
+        LendToken lendToken = LendToken(config.lendToken);
+
+        uint256 cash = _availableLiquidity(asset);
+        uint256 borrows = assetBalances[asset].totalBorrowed;
+
+        if (lendToken.totalSupply() == 0) return 1e18;
+
+        return ((cash + borrows) * 1e18) / lendToken.totalSupply();
     }
 
-    /**
-     * @notice Available liquidity for borrowing
-     */
-    function _availableLiquidity() internal view returns (uint256) {
-        return address(this).balance;
+    function _availableLiquidity(address asset)
+        internal
+        view
+        returns (uint256)
+    {
+        if (asset == address(0)) {
+            return address(this).balance;
+        }
+        return IERC20(asset).balanceOf(address(this));
     }
 
-    /**
-     * @notice Calculate pool utilization rate (0-10000 basis points)
-     */
-    function getUtilizationRate() external view returns (uint256) {
-        uint256 totalLiquidity = totalBorrowed + _availableLiquidity();
-        if (totalLiquidity == 0) return 0;
-        return (totalBorrowed * 10000) / totalLiquidity;
+    function _returnCollateral(Loan memory loan) internal {
+        if (loan.collateralAsset == address(0)) {
+            payable(loan.borrower).transfer(loan.collateral);
+        } else {
+            IERC20(loan.collateralAsset)
+                .safeTransfer(loan.borrower, loan.collateral);
+        }
     }
+
+    receive() external payable {}
 }

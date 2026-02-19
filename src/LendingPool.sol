@@ -67,11 +67,10 @@ contract LendingPool is ReentrancyGuard, Ownable {
     // ---------------- LENDING -------------------------
     // --------------------------------------------------
 
-    function deposit(address asset, uint256 amount)
-        external
-        payable
-        nonReentrant
-    {
+    function deposit(
+        address asset,
+        uint256 amount
+    ) external payable nonReentrant {
         AssetConfig memory config = assetConfigs[asset];
         require(config.isActive, "Asset not supported");
 
@@ -82,7 +81,11 @@ contract LendingPool is ReentrancyGuard, Ownable {
         } else {
             require(msg.value == 0, "No native token");
             depositAmount = amount;
-            IERC20(asset).safeTransferFrom(msg.sender, address(this), depositAmount);
+            IERC20(asset).safeTransferFrom(
+                msg.sender,
+                address(this),
+                depositAmount
+            );
         }
 
         uint256 exchangeRate = _getExchangeRate(asset);
@@ -91,10 +94,10 @@ contract LendingPool is ReentrancyGuard, Ownable {
         LendToken(config.lendToken).mint(msg.sender, mintAmount);
     }
 
-    function withdraw(address asset, uint256 aTokenAmount)
-        external
-        nonReentrant
-    {
+    function withdraw(
+        address asset,
+        uint256 aTokenAmount
+    ) external nonReentrant {
         AssetConfig memory config = assetConfigs[asset];
         require(config.isActive, "Not supported");
 
@@ -103,7 +106,10 @@ contract LendingPool is ReentrancyGuard, Ownable {
         uint256 exchangeRate = _getExchangeRate(asset);
         uint256 withdrawAmount = (aTokenAmount * exchangeRate) / 1e18;
 
-        require(withdrawAmount <= _availableLiquidity(asset), "Insufficient liquidity");
+        require(
+            withdrawAmount <= _availableLiquidity(asset),
+            "Insufficient liquidity"
+        );
 
         lendToken.burn(msg.sender, aTokenAmount);
 
@@ -124,12 +130,17 @@ contract LendingPool is ReentrancyGuard, Ownable {
         uint256 collateralAmount,
         uint256 borrowAmount
     ) external payable nonReentrant {
-
         AssetConfig memory colConfig = assetConfigs[collateralAsset];
         AssetConfig memory borConfig = assetConfigs[borrowAsset];
 
-        require(colConfig.isActive && colConfig.canBeCollateral, "Invalid collateral");
-        require(borConfig.isActive && borConfig.canBeBorrowed, "Invalid borrow asset");
+        require(
+            colConfig.isActive && colConfig.canBeCollateral,
+            "Invalid collateral"
+        );
+        require(
+            borConfig.isActive && borConfig.canBeBorrowed,
+            "Invalid borrow asset"
+        );
 
         uint256 actualCollateral;
 
@@ -138,17 +149,28 @@ contract LendingPool is ReentrancyGuard, Ownable {
         } else {
             require(msg.value == 0, "No native token");
             actualCollateral = collateralAmount;
-            IERC20(collateralAsset).safeTransferFrom(msg.sender, address(this), actualCollateral);
+            IERC20(collateralAsset).safeTransferFrom(
+                msg.sender,
+                address(this),
+                actualCollateral
+            );
         }
 
-        uint256 collateralValue = _getAssetValue(collateralAsset, actualCollateral);
+        uint256 collateralValue = _getAssetValue(
+            collateralAsset,
+            actualCollateral
+        );
 
-        uint256 maxBorrowValue = (collateralValue * BASIS_POINTS) / colConfig.collateralRatio;
+        uint256 maxBorrowValue = (collateralValue * BASIS_POINTS) /
+            colConfig.collateralRatio;
 
         uint256 borrowValue = _getAssetValue(borrowAsset, borrowAmount);
 
         require(borrowValue <= maxBorrowValue, "Exceeds borrow limit");
-        require(borrowAmount <= _availableLiquidity(borrowAsset), "Insufficient liquidity");
+        require(
+            borrowAmount <= _availableLiquidity(borrowAsset),
+            "Insufficient liquidity"
+        );
 
         uint256 apr = _calculateAPR(msg.sender, borrowAsset);
 
@@ -178,11 +200,10 @@ contract LendingPool is ReentrancyGuard, Ownable {
     // ---------------- REPAY ---------------------------
     // --------------------------------------------------
 
-    function repay(uint256 loanId, uint256 repayAmount)
-        external
-        payable
-        nonReentrant
-    {
+    function repay(
+        uint256 loanId,
+        uint256 repayAmount
+    ) external payable nonReentrant {
         Loan storage loan = loans[loanId];
         require(loan.active, "Inactive loan");
         require(msg.sender == loan.borrower, "Not borrower");
@@ -196,7 +217,11 @@ contract LendingPool is ReentrancyGuard, Ownable {
             payment = msg.value;
         } else {
             payment = repayAmount;
-            IERC20(loan.borrowAsset).safeTransferFrom(msg.sender, address(this), payment);
+            IERC20(loan.borrowAsset).safeTransferFrom(
+                msg.sender,
+                address(this),
+                payment
+            );
         }
 
         require(payment > 0, "No payment");
@@ -208,6 +233,7 @@ contract LendingPool is ReentrancyGuard, Ownable {
             assetBalances[loan.borrowAsset].totalInterestEarned += interest;
 
             _returnCollateral(loan);
+            // attempt to update credit score; if creditScore is not set properly this may revert
             creditScore.increaseScore(msg.sender, 10);
         } else {
             // partial repayment
@@ -220,18 +246,17 @@ contract LendingPool is ReentrancyGuard, Ownable {
     // ---------------- LIQUIDATION ---------------------
     // --------------------------------------------------
 
-    function liquidate(uint256 loanId)
-        external
-        payable
-        nonReentrant
-    {
+    function liquidate(uint256 loanId) external payable nonReentrant {
         Loan storage loan = loans[loanId];
         require(loan.active, "Inactive");
 
         uint256 interest = _interestOwed(loan);
         uint256 totalDebt = loan.principal + interest;
 
-        uint256 collateralValue = _getAssetValue(loan.collateralAsset, loan.collateral);
+        uint256 collateralValue = _getAssetValue(
+            loan.collateralAsset,
+            loan.collateral
+        );
         uint256 debtValue = _getAssetValue(loan.borrowAsset, totalDebt);
 
         AssetConfig memory config = assetConfigs[loan.collateralAsset];
@@ -244,7 +269,11 @@ contract LendingPool is ReentrancyGuard, Ownable {
         if (loan.borrowAsset == address(0)) {
             require(msg.value >= totalDebt, "Insufficient repay");
         } else {
-            IERC20(loan.borrowAsset).safeTransferFrom(msg.sender, address(this), totalDebt);
+            IERC20(loan.borrowAsset).safeTransferFrom(
+                msg.sender,
+                address(this),
+                totalDebt
+            );
         }
 
         loan.active = false;
@@ -252,9 +281,8 @@ contract LendingPool is ReentrancyGuard, Ownable {
         assetBalances[loan.borrowAsset].totalBorrowed -= loan.principal;
         assetBalances[loan.borrowAsset].totalInterestEarned += interest;
 
-        uint256 bonusCollateral =
-            (loan.collateral * (BASIS_POINTS + config.liquidationBonus))
-            / BASIS_POINTS;
+        uint256 bonusCollateral = (loan.collateral *
+            (BASIS_POINTS + config.liquidationBonus)) / BASIS_POINTS;
 
         uint256 seized = bonusCollateral > loan.collateral
             ? loan.collateral
@@ -273,11 +301,10 @@ contract LendingPool is ReentrancyGuard, Ownable {
     // ---------------- INTERNALS -----------------------
     // --------------------------------------------------
 
-    function _calculateAPR(address user, address asset)
-        internal
-        view
-        returns (uint256)
-    {
+    function _calculateAPR(
+        address user,
+        address asset
+    ) internal view returns (uint256) {
         AssetConfig memory config = assetConfigs[asset];
         int256 score = creditScore.getScore(user);
 
@@ -291,31 +318,23 @@ contract LendingPool is ReentrancyGuard, Ownable {
         return uint256(apr);
     }
 
-    function _interestOwed(Loan memory loan)
-        internal
-        view
-        returns (uint256)
-    {
+    function _interestOwed(Loan memory loan) internal view returns (uint256) {
         uint256 timeElapsed = block.timestamp - loan.startTime;
-        return (loan.principal * loan.apr * timeElapsed)
-            / (365 days * BASIS_POINTS);
+        return
+            (loan.principal * loan.apr * timeElapsed) /
+            (365 days * BASIS_POINTS);
     }
 
-    function _getAssetValue(address asset, uint256 amount)
-        internal
-        view
-        returns (uint256)
-    {
+    function _getAssetValue(
+        address asset,
+        uint256 amount
+    ) internal view returns (uint256) {
         uint256 price = oracle.getPrice(asset);
         uint8 decimals = oracle.getDecimals(asset);
         return (amount * price) / (10 ** decimals);
     }
 
-    function _getExchangeRate(address asset)
-        internal
-        view
-        returns (uint256)
-    {
+    function _getExchangeRate(address asset) internal view returns (uint256) {
         AssetConfig memory config = assetConfigs[asset];
         LendToken lendToken = LendToken(config.lendToken);
 
@@ -327,11 +346,9 @@ contract LendingPool is ReentrancyGuard, Ownable {
         return ((cash + borrows) * 1e18) / lendToken.totalSupply();
     }
 
-    function _availableLiquidity(address asset)
-        internal
-        view
-        returns (uint256)
-    {
+    function _availableLiquidity(
+        address asset
+    ) internal view returns (uint256) {
         if (asset == address(0)) {
             return address(this).balance;
         }
@@ -342,10 +359,64 @@ contract LendingPool is ReentrancyGuard, Ownable {
         if (loan.collateralAsset == address(0)) {
             payable(loan.borrower).transfer(loan.collateral);
         } else {
-            IERC20(loan.collateralAsset)
-                .safeTransfer(loan.borrower, loan.collateral);
+            IERC20(loan.collateralAsset).safeTransfer(
+                loan.borrower,
+                loan.collateral
+            );
         }
     }
 
     receive() external payable {}
+
+    // ---------------------------
+    // Admin / helpers
+    // ---------------------------
+
+    function addAsset(
+        address asset,
+        uint256 collateralRatio,
+        uint256 liquidationRatio,
+        uint256 baseAPR,
+        uint256 aprFloor,
+        uint256 liquidationBonus,
+        uint256 /* placeholder for legacy arg */,
+        bool canBeCollateral,
+        bool canBeBorrowed
+    ) external onlyOwner {
+        LendToken aToken = new LendToken();
+
+        assetConfigs[asset] = AssetConfig({
+            isActive: true,
+            collateralRatio: collateralRatio,
+            liquidationRatio: liquidationRatio,
+            baseAPR: baseAPR,
+            aprFloor: aprFloor,
+            liquidationBonus: liquidationBonus,
+            lendToken: address(aToken),
+            canBeCollateral: canBeCollateral,
+            canBeBorrowed: canBeBorrowed
+        });
+
+        supportedAssets.push(asset);
+    }
+
+    // Public wrappers to expose internals for testing
+    function availableLiquidity(address asset) external view returns (uint256) {
+        return _availableLiquidity(asset);
+    }
+
+    function getExchangeRate(address asset) external view returns (uint256) {
+        return _getExchangeRate(asset);
+    }
+
+    function interestOwed(uint256 loanId) external view returns (uint256) {
+        return _interestOwed(loans[loanId]);
+    }
+
+    function assetValue(
+        address asset,
+        uint256 amount
+    ) external view returns (uint256) {
+        return _getAssetValue(asset, amount);
+    }
 }

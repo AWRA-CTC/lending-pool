@@ -7,6 +7,7 @@ import "../src/CreditScore.sol";
 import "../src/LendToken.sol";
 import "../src/IPriceOracle.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {console} from "forge-std/console.sol";
 
 /// @notice Mock ERC20 token for testing
 contract MockERC20 is ERC20 {
@@ -256,5 +257,66 @@ contract LendingPoolTest is Test {
 
         (uint256 borrowTotal, ) = pool.assetBalances(address(tokenA));
         assertEq(borrowTotal, 75e18);
+    }
+
+    function test_Withdraw_WithInterest() public {
+        // Step 0: record user's underlying balance
+        uint256 balanceBefore = tokenA.balanceOf(user);
+
+        // Step 1: user deposits 100 tokenA
+        vm.prank(user);
+        pool.deposit(address(tokenA), 100e18);
+
+        // Step 2: borrower borrows (will generate interest)
+        vm.startPrank(borrower);
+        tokenB.approve(address(pool), type(uint256).max);
+        pool.borrow(address(tokenB), address(tokenA), 50e18, 20e18);
+        vm.stopPrank();
+
+        // Step 3: fast forward 365 days
+        vm.warp(block.timestamp + 365 days);
+
+        // Step 4: borrower repays with interest
+        vm.startPrank(borrower);
+        tokenA.mint(borrower, 10_000e18); // Ensure enough funds to repay
+        tokenA.approve(address(pool), type(uint256).max);
+        uint256 interest = pool.interestOwed(1);
+        console.log("Interest owed after 1 year:", interest / 1e18);
+        pool.repay(1, 20e18 + interest);
+        vm.stopPrank();
+
+        // Step 5: exchange rate should have increased
+        uint256 exchangeRate = pool.getExchangeRate(address(tokenA));
+        console.log(
+            "Exchange rate after interest accrual:",
+            exchangeRate / 1e18
+        );
+        assertGt(exchangeRate, 1e18, "Exchange rate should be > 1:1");
+
+        // Step 6: user withdraws aTokens and should end up with more tokenA than before
+        (, , , , , , address aTokenAddr, , ) = pool.assetConfigs(
+            address(tokenA)
+        );
+        LendToken aToken = LendToken(aTokenAddr);
+
+        vm.startPrank(user);
+        pool.withdraw(address(tokenA), 100e18);
+        vm.stopPrank();
+
+        uint256 balanceAfter = tokenA.balanceOf(user);
+        console.log("User balance before:", balanceBefore / 1e18);
+        console.log("User balance after:", balanceAfter / 1e18);
+
+        assertGt(
+            balanceAfter,
+            balanceBefore,
+            "User should have more underlying tokenA after interest"
+        );
+
+        assertEq(
+            aToken.balanceOf(user),
+            0,
+            "User's aToken balance should be zero after full withdrawal"
+        );
     }
 }

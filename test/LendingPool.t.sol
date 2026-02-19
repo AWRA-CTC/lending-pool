@@ -10,7 +10,11 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 /// @notice Mock ERC20 token for testing
 contract MockERC20 is ERC20 {
-    constructor(string memory name, string memory symbol, uint256 initialSupply) ERC20(name, symbol) {
+    constructor(
+        string memory name,
+        string memory symbol,
+        uint256 initialSupply
+    ) ERC20(name, symbol) {
         _mint(msg.sender, initialSupply);
     }
 
@@ -27,12 +31,18 @@ contract MockOracle is IPriceOracle {
         prices[asset] = price;
     }
 
-    function getDecimals(address asset) external view {
+    function getDecimals(address asset) external view override returns (uint8) {
         return 18;
     }
 
     function getPrice(address asset) external view override returns (uint256) {
         return prices[asset];
+    }
+
+    function getLastUpdated(
+        address asset
+    ) external view override returns (uint256) {
+        return block.timestamp;
     }
 }
 
@@ -54,6 +64,9 @@ contract LendingPoolTest is Test {
         oracle = new MockOracle();
         pool = new LendingPool(address(credit), address(oracle));
 
+        // set lending pool in credit contract so pool can call score updates
+        credit.setLendingPool(address(pool));
+
         // Deploy ERC20 tokens
         tokenA = new MockERC20("TokenA", "TKA", 1_000_000e18);
         tokenB = new MockERC20("TokenB", "TKB", 1_000_000e18);
@@ -63,46 +76,70 @@ contract LendingPoolTest is Test {
         tokenB.mint(borrower, 10_000e18);
 
         // Setup oracle prices
-        oracle.setPrice(address(tokenA), 1e8); // $1
-        oracle.setPrice(address(tokenB), 2e8); // $2
+        oracle.setPrice(address(tokenA), 1e18); // $1
+        oracle.setPrice(address(tokenB), 2e18); // $2
 
         // Add assets to lending pool
-        pool.addAsset(address(tokenA), 15000, 14000, 1500, 500, 1e18, 500, true, true);
-        pool.addAsset(address(tokenB), 15000, 14000, 1500, 500, 1e18, 500, true, true);
+        pool.addAsset(
+            address(tokenA),
+            15000,
+            14000,
+            1500,
+            500,
+            1e18,
+            500,
+            true,
+            true
+        );
+        pool.addAsset(
+            address(tokenB),
+            15000,
+            14000,
+            1500,
+            500,
+            1e18,
+            500,
+            true,
+            true
+        );
 
-        // Approve pool for ERC20 transfers
+        // Approve pool for ERC20 transfers from users
         vm.prank(user);
         tokenA.approve(address(pool), type(uint256).max);
 
         vm.prank(borrower);
         tokenB.approve(address(pool), type(uint256).max);
+
+        // Provide initial tokenB liquidity from the test contract (deployer has initial supply)
+        tokenB.approve(address(pool), type(uint256).max);
+        pool.deposit(address(tokenB), 1000e18);
     }
 
     // -------------------------
     // Internal function tests
     // -------------------------
     function testAvailableLiquidity() public {
-        // Initially zero
-        assertEq(pool.callStatic._availableLiquidity(address(tokenA)), 0);
+        // Initially zero for tokenA
+        assertEq(pool.availableLiquidity(address(tokenA)), 0);
 
         // Deposit some tokens
         vm.prank(user);
         pool.deposit(address(tokenA), 100e18);
 
-        uint256 liquidity = pool.callStatic._availableLiquidity(address(tokenA));
+        uint256 liquidity = pool.availableLiquidity(address(tokenA));
         assertEq(liquidity, 100e18);
     }
 
     function testGetExchangeRate() public {
         // Initially, exchange rate = 1e18
-        uint256 rate = pool.callStatic._getExchangeRate(address(tokenA));
+        uint256 rate = pool.getExchangeRate(address(tokenA));
         assertEq(rate, 1e18);
 
         // Deposit 100 tokens
         vm.prank(user);
         pool.deposit(address(tokenA), 100e18);
 
-        rate = pool.callStatic._getExchangeRate(address(tokenA));
+        rate = pool.getExchangeRate(address(tokenA));
         assertEq(rate, 1e18);
     }
 
@@ -116,7 +153,9 @@ contract LendingPoolTest is Test {
         pool.deposit(address(tokenA), 100e18);
 
         // Check aToken balance
-        address aTokenAddr = pool.assetConfigs(address(tokenA)).lendToken;
+        (, , , , , , address aTokenAddr, , ) = pool.assetConfigs(
+            address(tokenA)
+        );
         LendToken aToken = LendToken(aTokenAddr);
         assertEq(aToken.balanceOf(user), 100e18);
 
@@ -140,24 +179,28 @@ contract LendingPoolTest is Test {
 
         // Borrow
         vm.startPrank(borrower);
-        pool.borrow(address(tokenA), address(tokenB), 50e18, 25e18);
+        tokenB.approve(address(pool), type(uint256).max);
+        pool.borrow(address(tokenB), address(tokenA), 50e18, 20e18);
         vm.stopPrank();
 
         // Check loan data
-        LendingPool.Loan memory loan = pool.loans(1);
-        assertEq(loan.principal, 25e18);
-        assertEq(loan.collateral, 50e18);
+        (, , , uint256 principal, uint256 collateral, , , bool active) = pool
+            .loans(1);
+        assertEq(principal, 20e18);
+        assertEq(collateral, 50e18);
 
         // Repay loan
         vm.startPrank(borrower);
         tokenB.mint(borrower, 10_000e18); // Ensure enough funds
         tokenB.approve(address(pool), 100e18);
 
-        pool.repay(1, 25e18 + pool.callStatic._interestOwed(loan));
+        uint256 interest = pool.interestOwed(1);
+        tokenA.approve(address(pool), type(uint256).max);
+        pool.repay(1, 20e18 + interest);
         vm.stopPrank();
 
-        loan = pool.loans(1);
-        assertEq(loan.active, false);
+        (, , , , , , , active) = pool.loans(1);
+        assertEq(active, false);
     }
 
     // -------------------------
@@ -170,19 +213,22 @@ contract LendingPoolTest is Test {
 
         // Borrower borrows fully
         vm.startPrank(borrower);
-        pool.borrow(address(tokenA), address(tokenB), 100e18, 50e18);
+        pool.borrow(address(tokenB), address(tokenA), 100e18, 50e18);
         vm.stopPrank();
 
         // Simulate price drop to make loan undercollateralized
-        oracle.setPrice(address(tokenA), 1e8 / 2); // Collateral halves
+        oracle.setPrice(address(tokenB), 1e8 / 2); // Collateral halves
 
-        // Liquidate
+        // Liquidate (liquidator must pay tokenB debt)
         vm.startPrank(user);
+        // ensure user has tokenB to repay as liquidator
+        tokenA.mint(user, 1000e18);
+        tokenA.approve(address(pool), type(uint256).max);
         pool.liquidate(1);
         vm.stopPrank();
 
-        LendingPool.Loan memory loan = pool.loans(1);
-        assertEq(loan.active, false);
+        (, , , , , , , bool active) = pool.loans(1);
+        assertEq(active, false);
     }
 
     // -------------------------
@@ -201,14 +247,14 @@ contract LendingPoolTest is Test {
         vm.prank(user2);
         pool.deposit(address(tokenA), 200e18);
 
-        uint256 totalLiquidity = pool.callStatic._availableLiquidity(address(tokenA));
+        uint256 totalLiquidity = pool.availableLiquidity(address(tokenA));
         assertEq(totalLiquidity, 300e18);
 
         // Borrower borrows 150 tokenB worth
         vm.prank(borrower);
-        pool.borrow(address(tokenA), address(tokenB), 150e18, 75e18);
+        pool.borrow(address(tokenB), address(tokenA), 150e18, 75e18);
 
-        uint256 borrowTotal = pool.assetBalances(address(tokenB)).totalBorrowed;
+        (uint256 borrowTotal, ) = pool.assetBalances(address(tokenA));
         assertEq(borrowTotal, 75e18);
     }
 }

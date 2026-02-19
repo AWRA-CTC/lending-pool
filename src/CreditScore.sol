@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
+import {ICreditScore} from "./interfaces/ICreditScore.sol";
 
-contract CreditScore {
+contract CreditScore is ICreditScore {
     address public lendingPool;
 
     mapping(address => int256) private scores;
@@ -19,7 +20,10 @@ contract CreditScore {
     }
 
     function setLendingPool(address _lendingPool) external {
-        require(lendingPool == msg.sender || lendingPool == address(0), "Not authorized");
+        require(
+            lendingPool == msg.sender || lendingPool == address(0),
+            "Not authorized"
+        );
         lendingPool = _lendingPool;
     }
 
@@ -27,14 +31,20 @@ contract CreditScore {
         return scores[user];
     }
 
-    function increaseScore(address user, int256 amount) external onlyLendingPool {
+    function increaseScore(
+        address user,
+        int256 amount
+    ) external onlyLendingPool {
         scores[user] += amount;
         if (scores[user] > MAX_SCORE) {
             scores[user] = MAX_SCORE;
         }
     }
 
-    function decreaseScore(address user, int256 amount) external onlyLendingPool {
+    function decreaseScore(
+        address user,
+        int256 amount
+    ) external onlyLendingPool {
         scores[user] -= amount;
         if (scores[user] < MIN_SCORE) {
             scores[user] = MIN_SCORE;

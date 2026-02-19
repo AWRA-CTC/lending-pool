@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "./CreditScore.sol";
-import "./IPriceOracle.sol";
+import "./interfaces/ICreditScore.sol";
+import "./interfaces/IPriceOracle.sol";
 import "./LendToken.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -14,7 +14,7 @@ contract LendingPool is ReentrancyGuard, Ownable {
 
     uint256 public constant BASIS_POINTS = 10000;
 
-    CreditScore public creditScore;
+    ICreditScore public creditScore;
     IPriceOracle public oracle;
 
     uint256 public loanCounter;
@@ -59,7 +59,7 @@ contract LendingPool is ReentrancyGuard, Ownable {
     address[] public supportedAssets;
 
     constructor(address _creditScore, address _oracle) Ownable(msg.sender) {
-        creditScore = CreditScore(_creditScore);
+        creditScore = ICreditScore(_creditScore);
         oracle = IPriceOracle(_oracle);
     }
 

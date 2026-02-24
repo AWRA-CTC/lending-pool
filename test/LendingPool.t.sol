@@ -5,7 +5,7 @@ import "forge-std/Test.sol";
 import "../src/LendingPool.sol";
 import "../src/CreditScore.sol";
 import "../src/LendToken.sol";
-import "../src/IPriceOracle.sol";
+import "../src/interfaces/IPriceOracle.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {console} from "forge-std/console.sol";
 
@@ -202,6 +202,74 @@ contract LendingPoolTest is Test {
 
         (, , , , , , , active) = pool.loans(1);
         assertEq(active, false);
+    }
+
+    function testBorrowZeroAmountReverts() public {
+        vm.prank(user);
+        pool.deposit(address(tokenA), 100e18);
+
+        vm.startPrank(borrower);
+        vm.expectRevert(LendingPool.BorrowAmountZero.selector);
+        pool.borrow(address(tokenB), address(tokenA), 50e18, 0);
+        vm.stopPrank();
+    }
+
+    function testPartialRepayUpdatesTotalBorrowed() public {
+        vm.prank(user);
+        pool.deposit(address(tokenA), 100e18);
+
+        vm.prank(borrower);
+        pool.borrow(address(tokenB), address(tokenA), 50e18, 20e18);
+
+        vm.warp(block.timestamp + 365 days);
+
+        uint256 interest = pool.interestOwed(1);
+        uint256 totalOwed = 20e18 + interest;
+        uint256 partialPayment = 10e18;
+        assertLt(partialPayment, totalOwed);
+
+        vm.startPrank(borrower);
+        tokenA.mint(borrower, 10_000e18);
+        tokenA.approve(address(pool), type(uint256).max);
+        pool.repay(1, partialPayment);
+        vm.stopPrank();
+
+        (, , , uint256 newPrincipal, , , , bool activeAfterPartial) = pool
+            .loans(1);
+        uint256 expectedPrincipal = totalOwed - partialPayment;
+        assertEq(newPrincipal, expectedPrincipal);
+        assertTrue(activeAfterPartial);
+
+        (uint256 borrowedAfterPartial, ) = pool.assetBalances(address(tokenA));
+        assertEq(borrowedAfterPartial, expectedPrincipal);
+
+        vm.prank(borrower);
+        pool.repay(1, expectedPrincipal);
+
+        (uint256 borrowedAfterFull, ) = pool.assetBalances(address(tokenA));
+        assertEq(borrowedAfterFull, 0);
+    }
+
+    function testRepayOverpaymentIsRefundedForERC20() public {
+        vm.prank(user);
+        pool.deposit(address(tokenA), 100e18);
+
+        vm.prank(borrower);
+        pool.borrow(address(tokenB), address(tokenA), 50e18, 20e18);
+
+        vm.startPrank(borrower);
+        tokenA.mint(borrower, 10_000e18);
+        tokenA.approve(address(pool), type(uint256).max);
+
+        uint256 totalOwed = 20e18 + pool.interestOwed(1);
+        uint256 overpayment = totalOwed + 5e18;
+        uint256 balanceBefore = tokenA.balanceOf(borrower);
+
+        pool.repay(1, overpayment);
+
+        uint256 balanceAfter = tokenA.balanceOf(borrower);
+        assertEq(balanceBefore - balanceAfter, totalOwed);
+        vm.stopPrank();
     }
 
     // -------------------------

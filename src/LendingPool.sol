@@ -141,6 +141,7 @@ contract LendingPool is ReentrancyGuard, Ownable {
             borConfig.isActive && borConfig.canBeBorrowed,
             "Invalid borrow asset"
         );
+        require(borrowAmount > 0, "Borrow amount must be > 0");
 
         uint256 actualCollateral;
 
@@ -210,6 +211,7 @@ contract LendingPool is ReentrancyGuard, Ownable {
 
         uint256 interest = _interestOwed(loan);
         uint256 totalOwed = loan.principal + interest;
+        uint256 oldPrincipal = loan.principal;
 
         uint256 payment;
 
@@ -229,15 +231,32 @@ contract LendingPool is ReentrancyGuard, Ownable {
         if (payment >= totalOwed) {
             // full repayment
             loan.active = false;
-            assetBalances[loan.borrowAsset].totalBorrowed -= loan.principal;
+            assetBalances[loan.borrowAsset].totalBorrowed -= oldPrincipal;
             assetBalances[loan.borrowAsset].totalInterestEarned += interest;
 
             _returnCollateral(loan);
             // attempt to update credit score; if creditScore is not set properly this may revert
             creditScore.increaseScore(msg.sender, 10);
+
+            uint256 excessPayment = payment - totalOwed;
+            if (excessPayment > 0) {
+                if (loan.borrowAsset == address(0)) {
+                    payable(msg.sender).transfer(excessPayment);
+                } else {
+                    IERC20(loan.borrowAsset).safeTransfer(
+                        msg.sender,
+                        excessPayment
+                    );
+                }
+            }
         } else {
             // partial repayment
-            loan.principal = totalOwed - payment;
+            uint256 newPrincipal = totalOwed - payment;
+            assetBalances[loan.borrowAsset].totalBorrowed =
+                assetBalances[loan.borrowAsset].totalBorrowed -
+                oldPrincipal +
+                newPrincipal;
+            loan.principal = newPrincipal;
             loan.startTime = block.timestamp;
         }
     }
@@ -407,6 +426,16 @@ contract LendingPool is ReentrancyGuard, Ownable {
 
     function getExchangeRate(address asset) external view returns (uint256) {
         return _getExchangeRate(asset);
+    }
+
+    function getSupportedAssets() external view returns (address[] memory) {
+        return supportedAssets;
+    }
+
+    function getUserLoanIds(
+        address user
+    ) external view returns (uint256[] memory) {
+        return userLoans[user];
     }
 
     function interestOwed(uint256 loanId) external view returns (uint256) {
